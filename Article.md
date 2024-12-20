@@ -115,31 +115,8 @@ afl-clang-fast main.c -lreadline -o bin_fast
 
 И декомпилируем получившийся исполняемый файл в IDA PRO:
 
-```c
-int __fastcall main(int argc, const char **argv, const char **envp)
-{
-  char *v3; // rbx
-  char *v4; // r14
+![bin_fast_decomp.png](images/bin_fast_decomp.png)
 
-  *((_BYTE *)_afl_area_ptr + _start___sancov_guards) += __CFADD__(*((_BYTE *)_afl_area_ptr + _start___sancov_guards), 1)
-                                                      + 1;
-  v3 = (char *)readline("Enter your string \n", argv);
-  v4 = (char *)malloc(0xAuLL);
-  if ( v3 )
-  {
-    *((_BYTE *)_afl_area_ptr + dword_91A0) += __CFADD__(*((_BYTE *)_afl_area_ptr + dword_91A0), 1) + 1;
-    strcpy(v4, v3);
-    printf("%s", v4);
-    free(v3);
-    free(v4);
-  }
-  else
-  {
-    *((_BYTE *)_afl_area_ptr + dword_919C) += __CFADD__(*((_BYTE *)_afl_area_ptr + dword_919C), 1) + 1;
-  }
-  return 0;
-}
-```
 
 Внимательный читатель обратит внимание на появищиеся конструкции, которые сопровождает перемення `_afl_area_ptr`.
 Помните выше мы ввели термин *карта покрытия* так вот - это  `_afl_area_ptr`. `_afl_area_ptr` - это массив, к которому осуществляется доступ каждый раз при достижении новой области. Обратите внимание, что есть доступ к `__afl_area_ptr` происходит во всех ветвелниях кода  - в операторе if и в операторе else.
