@@ -555,8 +555,23 @@ if (unlikely(waitpid(child_pid, &status, is_persistent ? WUNTRACED : 0) < 0)) {
 
 Если фаззинг запушен в режиме `persistant mode`, то мы ждем, пока дочерний процесс не **остановится** `(WUNTRACED)`, а не **завершится**. Причина этого кроется в макросе `__AFL_LOOP`, который расширяется в функцию `__afl_persistent_loop`. [Исходник функции](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/instrumentation/afl-compiler-rt.o.c#L1111)
 
-Идея этой функции в том, что существует статическая переменная `cycle_cnt`, которая отвечает за количество оставшихся циклов. В конце каждого цикла (кроме случая, когда `cycle_cnt = 0`, в этом случае происходит остановка), [посылается сигнал](https://github.com/AFLplusplus/AFLplusplus/blob/24503fba5fd2580559223ec3c6ee408dfa15e080/instrumentation/afl-compiler-rt.o.c#L1282) `SIGSTOP` . Это вызывает выполнение условия `waitpid`, что позволяет `afl-fuzz` выполнить свои мутации и обновить карту покрытия. Как только управление возвращается в форксервер, бинарник возобновляется с [помощью сигнала]() `SIGCONT` - еще раз внимательно смотрим код [функции](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/instrumentation/afl-compiler-rt.o.c#L1067) `__afl_start_forkserver`
+Идея этой функции в том, что существует статическая переменная `cycle_cnt`, которая отвечает за количество оставшихся циклов. В конце каждого цикла (кроме случая, когда `cycle_cnt = 0`, в этом случае происходит остановка), [посылается сигнал](https://github.com/AFLplusplus/AFLplusplus/blob/24503fba5fd2580559223ec3c6ee408dfa15e080/instrumentation/afl-compiler-rt.o.c#L1282) `SIGSTOP` . Это вызывает выполнение условия `waitpid`, что позволяет `afl-fuzz` выполнить свои мутации и обновить карту покрытия. Как только управление возвращается в форксервер, бинарник возобновляется с [помощью сигнала]() `SIGCONT` - еще раз внимательно смотрим код [функции](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/instrumentation/afl-compiler-rt.o.c#L1067) `__afl_start_forkserver`.
 
+
+`_AFL_FUZZ_TESTCASE_BUF` — это фактический буфер, куда подаются входные наборы данных. Этот буфер указывает на область общей памяти. Эта область памяти обновляется между циклами.
+`__AFL_FUZZ_TESTCASE_LEN` — это фактическая длина этого буфера.
+
+Инициализация фаззинга начиантся с функции  `__afl_map_shm_fuzz`. Эта функция вызывается из `__afl_start_forkserver` всякий раз, когда запускается фаззинг с использованием общей (разделяемой) памяти. Для этого используется переменная `__afl_sharedmem_fuzzing`, которая устанавливается в 1 всякий раз, когда используется общая память. Эта переменная  так же подниммается в 1, когда [используется макрос](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/src/afl-cc.c#L1592) `__AFL_FUZZ_INIT()`
+
+`__afl_map_shm_fuzz` работает очень похоже на `__afl_map_shm`, которую мы рассматривали выше. Она получает идентификатор `shmem` из переменной окружения `__AFL_SHM_FUZZ_ID` —  как я писал выше это всего лишь обертка для `SHM_FUZZ_ENV_VAR`. Затем она запускает функцию `shmat` для сопоставления  области разделяемой памяти с [процессом](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/instrumentation/afl-compiler-rt.o.c#L314).
+
+После сопоставления области мы устанавливаем `__afl_fuzz_len` и `__afl_fuzz_ptr` (это `define` для  `__AFL_FUZZ_TESTCASE_LEN` и `__AFL_FUZZ_TESTCASE_BUF` соответственно) [следующим образом](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/instrumentation/afl-compiler-rt.o.c#L314):
+```C
+__afl_fuzz_len = (u32 *)map;
+__afl_fuzz_ptr = map + sizeof(u32);
+```
+
+**Важно!** Обратите внимание, что `__afl_fuzz_len` на самом деле является типом данных `u32*`, поскольку первые 4 байта карты памяти на самом деле являются размером данных.
 
 ### Пара слов про санитайзеры кода
 
@@ -600,7 +615,7 @@ u32 get_map_size(void) {
 
     }
 
-    if (map_size % 64) { map_size = (((map_size >> 6) + 1) << 6); }
+    if (map_size % 64) { map_size = (((map_size >> 6) + 1) << 6); } // если значение не кратно 64, то округляем вверх
 
   } else if (getenv("AFL_SKIP_BIN_CHECK")) {
 
@@ -612,5 +627,316 @@ u32 get_map_size(void) {
 
 }
 ```
+По умолчанию используется `DEFAULT_SHMEM_SIZE`, [размер](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/include/config.h#L44) которого равен 8 МБ. В противном случае можно задать размер карты с помощью переменных окружения `AFL_MAP_SIZE` или `AFL_MAPSIZE`.
+
+
+Второй важный шаг — [инициализация структур](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/src/afl-fuzz.c#L595) `afl_state_t` и `afl_forkserver_t`:
+
+```c
+afl_state_init(afl, map_size);
+...
+afl_fsrv_init(&afl->fsrv);
+```
+
+Эти две функции задают несколько важных переменных.
+
+Функция `afl_state_init` устанавливает [размер](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/src/afl-fuzz-state.c#L82) карты покрытия в значение `map_size`, как показано ниже:
+
+```C
+afl->shm.map_size = map_size ? map_size : MAP_SIZE;
+```
+
+`afl_fsrv_init` [устанавливает](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/src/afl-forkserver.c#L238) следующие переменные 
+
+```C
+
+fsrv->out_fd = -1; 
+...
+fsrv->use_stdin = true; //по умолчанию используем поток ввода
+...
+fsrv->child_pid = -1; 
+```
+
+После этого мы [устанавливаем](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/src/afl-fuzz.c#L609) `afl->shmem_testcase_mode = 1`. Это гарантирует, что мы всегда будем пытаться использовать общую память для хранения тестовых данных.
+
+Далее `afl-fuzz` обрабатывает флаги командной строки и сохраняет их при необходимости. Большинство этих аргументов предназначены для управления другими режимами работы `AFL++`, такими как `QEMU` или `Frida`. Однако есть один флаг командной строки, который нас интересует: `-o,` [представляющий каталог](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/src/afl-fuzz.c#L822) для выходных данных.
+
+
+```C
+     case 'o':                                               
+        if (afl->out_dir) { FATAL("Multiple -o options not supported"); }
+        afl->out_dir = optarg;
+```
+
+```C
+  if (!afl->fsrv.out_file) {
+
+    u32 j = optind + 1;
+    while (argv[j]) {
+      u8 *aa_loc = strstr(argv[j], "@@");
+      if (aa_loc && !afl->fsrv.out_file) {
+        afl->fsrv.use_stdin = 0;
+        default_output = 0;
+        if (afl->file_extension) {
+          afl->fsrv.out_file = alloc_printf("%s/.cur_input.%s", afl->tmp_dir,
+                                            afl->file_extension);
+        } else {
+          afl->fsrv.out_file = alloc_printf("%s/.cur_input", afl->tmp_dir);
+        }
+        detect_file_args(argv + optind + 1, afl->fsrv.out_file,
+                         &afl->fsrv.use_stdin);
+        break;
+      }
+      ++j;
+    }
+```
+afl->fsrv.out_file — это файл, в который записываются входные данные.
+
+В [данном коде](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/src/afl-fuzz.c#L2355) происходит следующее:
+Сначала программа проходит по аргументам командной строки (`argv`) и ищет символы `@@`. Напомним, что `@@` заменяется на имя входного файла, если входные данные передаются через аргументы командной строки.
+Пример запуска фаззера:
+```bash
+afl-fuzz -i in -o out -- ./bin @@
+```
+
+Если `@@` найден, с помощью функции `alloc_printf` (аналог `sprintf`) формируется путь, по которому будут записываться тестовые данные. Кроме того, переменной `afl->fsrv.use_stdin` присваивается значение `0`, чтобы указать, что данные поступают через аргументы командной строки, а не через стандартный поток ввода (`stdin`).
+
+Путь для записи входных данных выглядит так: `[output dir]/.cur_input.`
+Если нужно использовать другой каталог вместо выходного, это можно сделать через переменную окружения `AFL_TMPDIR`. Это особенно полезно, если указать каталог, расположенный на файловой системе, смонтированной в оперативной памяти (например, `ramdisk`), что позволяет увеличить скорость фаззера.
+
+Если `@@` не найден, [вызывается функция](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/src/afl-fuzz-init.c#L2401) `setup_stdio_file`, и входные данные передаются через стандартный ввод (`stdin`).
+
+Рассмотрим её подробнее:
+
+```C
+void setup_stdio_file(afl_state_t *afl) {
+  if (afl->file_extension) {
+    afl->fsrv.out_file =
+        alloc_printf("%s/.cur_input.%s", afl->tmp_dir, afl->file_extension);
+  } else {
+    afl->fsrv.out_file = alloc_printf("%s/.cur_input", afl->tmp_dir);
+  }
+  unlink(afl->fsrv.out_file);                              /* Ignore errors */
+  afl->fsrv.out_fd =
+      open(afl->fsrv.out_file, O_RDWR | O_CREAT | O_EXCL, DEFAULT_PERMISSION);
+  if (afl->fsrv.out_fd < 0) {
+    PFATAL("Unable to create '%s'", afl->fsrv.out_file);
+  }
+}
+```
+
+Эта функция очень похожа на код для обработки аргументов командной строки. Однако обратите внимание, что в отличие от `@@`, здесь мы открываем выходной файл.
+
+Мы почти готовы запустить фаззер. Прежде всего, нам нужно настроить дескрипторы общей памяти как для карты покрытия.
+
+Настройка тестового примера с общей памятью:
+```C
+if (afl->shmem_testcase_mode) { setup_testcase_shmem(afl); }
+```
+
+Как мы уже обсуждали, `afl->shmem_testcase_mode` всегда равен `1`, поэтому мы всегда запускаем [функцию](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/src/afl-fuzz-init.c#L2855)`setup_testcase_shmem`, которая выполняет следующее:
+
+```C
+void setup_testcase_shmem(afl_state_t *afl) {
+  afl->shm_fuzz = ck_alloc(sizeof(sharedmem_t));
+  u8 *map = afl_shm_init(afl->shm_fuzz, MAX_FILE + sizeof(u32), 1);
+  afl->shm_fuzz->shmemfuzz_mode = 1;
+
+  if (!map) { FATAL("BUG: Zero return from afl_shm_init."); }
+
+#ifdef USEMMAP
+  setenv(SHM_FUZZ_ENV_VAR, afl->shm_fuzz->g_shm_file_path, 1);
+#else
+  u8 *shm_str = alloc_printf("%d", afl->shm_fuzz->shm_id);
+  setenv(SHM_FUZZ_ENV_VAR, shm_str, 1);
+  ck_free(shm_str);
+#endif
+  afl->fsrv.support_shmem_fuzz = 1;
+  afl->fsrv.shmem_fuzz_len = (u32 *)map;
+  afl->fsrv.shmem_fuzz = map + sizeof(u32);
+}
+```
+
+Этот код выполняет несколько важных действий. Во-первых, он создает саму область общей памяти с помощью `afl_shm_init`. Затем устанавливает переменную окружения `SHM_FUZZ_ENV_VAR`. Как мы уже видели, эта переменная используется для настройки области памяти.
+
+Кроме того, помимо настройки переменных окружения, также настраиваются переменные `fsrv`. Обратите внимание, как `afl->fsrv.shmem_fuzz_len = (u32 *)map;`.
+Это соответствует тому, что мы видели ранее, когда в настройке инструментирования было установлено `__afl_fuzz_len = (u32*)map.`
+
+[Далее](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/src/afl-fuzz.c#L2486) настраивается общая карта покрытия:
+
+```C
+  afl->fsrv.trace_bits =
+      afl_shm_init(&afl->shm, afl->fsrv.map_size, afl->non_instrumented_mode);
+  ...
+    if (map_size <= DEFAULT_SHMEM_SIZE) {
+      afl->fsrv.map_size = DEFAULT_SHMEM_SIZE;  // dummy temporary value
+      char vbuf[16];
+      snprintf(vbuf, sizeof(vbuf), "%u", DEFAULT_SHMEM_SIZE);
+      setenv("AFL_MAP_SIZE", vbuf, 1);
+    }
+```
+
+Это довольно похоже на настройку общей памяти для хранения тестовых данных, так как снова используется `afl_shm_init`. Обратите внимание, что размер задается через `afl->fsrv.map_size`, который мы настраивали ранее. 
+
+Когда все это настроено, мы, наконец, готовы запустить `forkserver`. Это происходит через [функцию](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/src/afl-forkserver.c#L1717) `afl_fsrv_get_mapsize`, которая выполняет следующие действия:
+```C
+u32 afl_fsrv_get_mapsize(afl_forkserver_t *fsrv, char **argv,
+                         volatile u8 *stop_soon_p, u8 debug_child_output) {
+  afl_fsrv_start(fsrv, argv, stop_soon_p, debug_child_output);
+  return fsrv->map_size;
+}
+```
+
+Затем мы вызываем [функцию](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/src/afl-forkserver.c#L557) `afl_fsrv_start`, которая выполняет основную работу. Большая часть начала этой функции занимается настройкой параметров для различных опций и режимов работы. Основная работа начинается, когда мы настраиваем каналы и делаем fork основого процесса:
+
+```C
+if (pipe(st_pipe) || pipe(ctl_pipe)) { PFATAL("pipe() failed"); }
+...
+fsrv->fsrv_pid = fork();
+```
+
+
+Здесь мы можем сосредоточиться на дочернем и родительском процессе по отдельности. [Код](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/src/afl-forkserver.c#L942) для дочернего процесса приведен ниже:
+
+```C
+ if (!fsrv->use_stdin) {
+      dup2(fsrv->dev_null_fd, 0);
+    } else {
+      dup2(fsrv->out_fd, 0);
+      close(fsrv->out_fd);
+    }
+    if (dup2(ctl_pipe[0], FORKSRV_FD) < 0) { PFATAL("dup2() failed"); }
+    if (dup2(st_pipe[1], FORKSRV_FD + 1) < 0) { PFATAL("dup2() failed"); }
+
+    close(ctl_pipe[0]);
+    close(ctl_pipe[1]);
+    close(st_pipe[0]);
+    close(st_pipe[1]);
+
+    close(fsrv->out_dir_fd);
+    close(fsrv->dev_null_fd);
+    close(fsrv->dev_urandom_fd);
+
+    if (fsrv->plot_file != NULL) {
+
+      fclose(fsrv->plot_file);
+      fsrv->plot_file = NULL;
+    }
+
+    if (!getenv("LD_BIND_LAZY")) { setenv("LD_BIND_NOW", "1", 1); }
+
+    set_sanitizer_defaults();
+
+    fsrv->init_child_func(fsrv, argv);
+```
+
+Дочерний процесс выполняет совсем немного действий.
+
+Сначала, если для ввода используется стандартный поток ввода (`stdin`), его заменяют файловым дескриптором, который указывает на `out_fd`, настроенный ранее.
+
+Затем с помощью `dup2` настраивают поток чтения и поток управления:
+```C
+if (dup2(ctl_pipe[0], FORKSRV_FD) < 0) { PFATAL("dup2() failed"); }
+if (dup2(st_pipe[1], FORKSRV_FD + 1) < 0) { PFATAL("dup2() failed"); }
+```
+
+Этот код перенаправляет потоки ввода и вывода дочернего процесса через каналы. Он настраивает, чтобы дочерний процесс читал из управляющего канала и писал в канал статуса, используя соответствующие файловые дескрипторы. Если процесс перенаправления не удается, программа завершится с ошибкой.
+
+Слудющий участок кода, состоящий из функций `close` выполняет закрытие файловых дескрипторов. Он освобождает ресурсы, которые были открыты для работы с каналами и другими файлами.
+
+Далее выполняем `fsrv->init_child_func(fsrv, argv)` для запуска дочеренего процесса.
+
+
+Давайте вернемся к родительскому процессу. Поскольку [его код](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/src/afl-forkserver.c#L1003) гораздо сложнее, то начнем его рассматривать сразу после создания `fork'a`:
+
+```C
+  close(ctl_pipe[0]);
+  close(st_pipe[1]);
+
+  fsrv->fsrv_ctl_fd = ctl_pipe[1];
+  fsrv->fsrv_st_fd = st_pipe[0];
+
+  /* Wait for the fork server to come up, but don't wait too long. */
+  rlen = 0;
+  if (fsrv->init_tmout) {
+	...
+  } else {
+    rlen = read(fsrv->fsrv_st_fd, &status, 4);
+  }
+```
+
+Сначала мы закрываем  управляющий канал, открытый на чтение (`control pipe`) и канал статуса (`status pipe`), открытый на запись, так как эти каналы используются исключительно для запуска `forkserver`.
+
+После этого мы читаем переменную состояния (`status variable`), отправленную `forkserver`. Эта переменная состояния содержит информацию о целевом бинарном файле. Как вы могли заметить, эта переменная была отправлена в `forkserver` на предыдущем этапе.
+
+С помощью этой переменной состояния `forkserver` инициализирует и включает необходимые параметры. Это можно увидеть в двух фрагментах кода ниже:
+
+[Тут](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/src/afl-forkserver.c#L1303)
+
+```C
+    if ((status & FS_OPT_SHDMEM_FUZZ) == FS_OPT_SHDMEM_FUZZ) {
+        if (fsrv->support_shmem_fuzz) {
+          fsrv->use_shmem_fuzz = 1;
+          if (!be_quiet) { ACTF("Using SHARED MEMORY FUZZING feature."); }
+          if ((status & FS_OPT_AUTODICT) == 0 || ignore_autodict) {
+            u32 send_status = (FS_OPT_ENABLED | FS_OPT_SHDMEM_FUZZ);
+            if (write(fsrv->fsrv_ctl_fd, &send_status, 4) != 4) {
+              FATAL("Writing to forkserver failed.");
+            }
+          }
+        } else {
+          FATAL(
+              "Target requested sharedmem fuzzing, but we failed to enable "
+              "it.");
+        }
+      }
+```
+В приведенном фрагменте кода выше мы включаем функцию фаззинга через общую память (`shared memory fuzzing`). Если `fsrv->support_shmem_fuzz != 1`, то это означает, что поддержка фаззинга через общую память невозможна. В этом случае выводится сообщение об ошибке, и процесс завершается.
+
+Если же поддержка включена, то мы устанавливаем `fsrv->use_shmem_fuzz = 1` и сообщаем дочернему процессу, что общая память готова к использованию.
+
+
+```C
+   if ((status & FS_OPT_MAPSIZE) == FS_OPT_MAPSIZE) {
+        u32 tmp_map_size = FS_OPT_GET_MAPSIZE(status);
+        if (!fsrv->map_size) { fsrv->map_size = MAP_SIZE; }
+        fsrv->real_map_size = tmp_map_size;
+        if (tmp_map_size % 64) {
+          tmp_map_size = (((tmp_map_size + 63) >> 6) << 6);
+        }
+        if (!be_quiet) { ACTF("Target map size: %u", fsrv->real_map_size); }
+        if (tmp_map_size > fsrv->map_size) {
+          FATAL(
+              "Target's coverage map size of %u is larger than the one this "
+              "afl++ is set with (%u). Either set AFL_MAP_SIZE=%u and restart"
+              " afl-fuzz, or change MAP_SIZE_POW2 in config.h and recompile "
+              "afl-fuzz",
+              tmp_map_size, fsrv->map_size, tmp_map_size);
+        }
+        fsrv->map_size = tmp_map_size;
+      }
+```
+
+В приведенном фрагменте кода мы занимаемся настройкой размера карты покрытия. Сначала мы получаем размер карты из переменной `status` и сохраняем его в `tmp_map_size`. Затем мы сравниваем этот размер с заранее выделенным размером карты (`fsrv->map_size`). Если полученный размер карты больше выделенного размера, программа завершится с ошибкой, так как мы не можем обработать карту такого размера.
+
+После этого размер карты обновляется в `fsrv->map_size`, если все условия удовлетворены.
+
+На этом этапе forkserver полностью настроен, и мы готовы перейти к рассмотению `afl-fuzz`.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
