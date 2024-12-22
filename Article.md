@@ -1,4 +1,4 @@
-## От автора 
+# От автора 
 Написание этой статьи было вызвано отсутствием комплексных материалов о структуре фаззера AFL++ на русском языке, а также необходиомтью устранить собственные пробелы в знаниях.
 
 На протяжении всей статьи будут приведены ссылки на исходный код, который относится к последней стабильной версии AFL++ 4.30. Всё, что описано в статье, основывается именно на этой версии, но с высокой вероятностью будет актуально как для более старых, так и для более новых версий, так как затрагивает основные механизмы работы этого фаззера.
@@ -895,6 +895,7 @@ if (dup2(st_pipe[1], FORKSRV_FD + 1) < 0) { PFATAL("dup2() failed"); }
 
 Если же поддержка включена, то мы устанавливаем `fsrv->use_shmem_fuzz = 1` и сообщаем дочернему процессу, что общая память готова к использованию.
 
+И [тут](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/src/afl-forkserver.c#L1331)
 
 ```C
    if ((status & FS_OPT_MAPSIZE) == FS_OPT_MAPSIZE) {
@@ -928,13 +929,265 @@ if (dup2(st_pipe[1], FORKSRV_FD + 1) < 0) { PFATAL("dup2() failed"); }
 
 
 
+## Пару слов об времени выполения `afl-fuzz`
+
+Время выполнения `afl-fuzz` основывается на единственном [цикле](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/src/afl-fuzz.c#L3103) `do-while`, который выполняет основную логику работы фаззера:
+```C
+do {
+  if (likely(!afl->old_seed_selection)) {
+    // Если в очереди появились новые элементы (prev_queued_items < afl->queued_items) или требуется реинициализация таблицы
+    // (afl->reinit_table), пересоздается alias-таблица, которая помогает приоритетно обрабатывать элементы очереди.
+    if (unlikely(prev_queued_items < afl->queued_items || 
+                 afl->reinit_table)) {
+      prev_queued_items = afl->queued_items;
+      create_alias_table(afl);
+    }
+    // C помощью функции select_next_queue_entry выбирается следующий элемент из очереди для обработки.
+    // Проверяется, что индекс выбранного элемента `current_entry` находится в пределах доступных элементов в очереди.
+    // Если нет, продолжается выбор.
+    // После выбора элемент записывается в queue_cur.
+    do {
+      afl->current_entry = select_next_queue_entry(afl);
+    } while (unlikely(afl->current_entry >= afl->queued_items));
+    afl->queue_cur = afl->queue_buf[afl->current_entry];
+  }
+  //Основная часть фаззинга происходит в функции fuzz_one
+  skipped_fuzz = fuzz_one(afl);
+
+  ...
+  // Старая стратегия выбора seed'ов, не будем на ней останавливаться, сейчас испольузется редко
+  if (unlikely(!afl->stop_soon && exit_1)) { afl->stop_soon = 2; }
+  if (unlikely(afl->old_seed_selection)) {
+    while (++afl->current_entry < afl->queued_items &&
+           afl->queue_buf[afl->current_entry]->disabled) {};
+    if (unlikely(afl->current_entry >= afl->queued_items || 
+                 afl->queue_buf[afl->current_entry] == NULL || 
+                 afl->queue_buf[afl->current_entry]->disabled)) {
+      afl->queue_cur = NULL;
+    } else {
+      afl->queue_cur = afl->queue_buf[afl->current_entry];
+    }
+  }
+} while (skipped_fuzz && afl->queue_cur && !afl->stop_soon);
+
+```
+
+В приведенном выше фрагменте кода мы, по сути, настраиваем очередь для фаззинга.
+
+Основная часть фаззинга происходит в [функции](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/src/afl-fuzz-one.c#L6165) `fuzz_one`. Это большая функция, которая выполняет множество операций, связанных с мутацией, и она действительно заслуживает отдельной статьи. В рамках этой статьи я пропущу детали и перейду к тому моменту, где входные данные записываются в `forkserver` и он запускается.
 
 
+Входные данные подаются в [функцию](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/src/afl-fuzz-run.c#L1184) с названием `common_fuzz_stuff`. Вот соответствующий фрагмент кода:
+
+```C
+  u8 fault;
+  if (unlikely(len = write_to_testcase(afl, (void **)&out_buf, len, 0)) == 0) {
+    return 0;
+  }
+  fault = fuzz_run_target(afl, &afl->fsrv, afl->fsrv.exec_tmout);
+```
+
+Сначала вызывается [функция](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/src/afl-fuzz-run.c#L115) `write_to_testcase`, которая, как следует из названия, записывает тестовый данные в входной файл. `write_to_testcase` обрабатывает множество особых случаев, но основная работа выполняется в функции `afl_fsrv_write_to_testcase`.
+Ёе [исходный код](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/src/afl-forkserver.c#L1727) представлен ниже:
+
+```C
+if (likely(fsrv->use_shmem_fuzz)) {
+    // Если используется общая память для фаззинга, ограничиваем длину передаваемых данных.
+    if (unlikely(len > MAX_FILE)) 
+        len = MAX_FILE;  // Если длина данных больше максимального размера файла, устанавливаем длину на максимально возможное значение.
+    // Записываем длину в общую память.
+    *fsrv->shmem_fuzz_len = len;
+    // Копируем данные из буфера в общую память.
+    memcpy(fsrv->shmem_fuzz, buf, len);
+    ...
+} else {
+    // Если не используется общая память, работаем с файловым дескриптором.
+    s32 fd = fsrv->out_fd;
+    // Если не используется стандартный ввод и задан выходной файл, работаем с файлом.
+    if (!fsrv->use_stdin && fsrv->out_file) {   
+        // Если не нужно удалять файл, обрабатываем его по обычному сценарию.
+        if (unlikely(fsrv->no_unlink)) {
+            ...
+        } else {
+            // Если нужно удалить файл перед записью, вызываем unlink, игнорируя возможные ошибки.
+            unlink(fsrv->out_file);  // Игнорируем ошибки удаления файла.
+            
+            // Создаем новый файл с флагами: запись, создание и исключение, если файл уже существует.
+            fd = open(fsrv->out_file, O_WRONLY | O_CREAT | O_EXCL, DEFAULT_PERMISSION);
+        }
+        
+        // Проверка, что файл был успешно открыт, иначе выводим ошибку.
+        if (fd < 0) { 
+            PFATAL("Unable to create '%s'", fsrv->out_file); 
+        }
+    } else if (unlikely(fd <= 0)) {
+        // Если файловый дескриптор не задан, возникает ошибка.
+        FATAL("Nowhere to write output to (neither out_fd nor out_file set (fd is %d))", fd);
+    } else {
+        // Если дескриптор валиден, устанавливаем его в начало файла.
+        lseek(fd, 0, SEEK_SET);
+    }
+    // Пишем данные в файл или на выходной дескриптор.
+    ck_write(fd, buf, len, fsrv->out_file);
+    
+    // Если используется stdin, обрабатываем файл как стандартный ввод.
+    if (fsrv->use_stdin) {
+        // Обрезаем файл до нужной длины.
+        if (ftruncate(fd, len)) { 
+            PFATAL("ftruncate() failed"); 
+        }
+        
+        // Сдвигаем указатель на начало файла.
+        lseek(fd, 0, SEEK_SET);
+    } else {
+        // Если не используется stdin, закрываем файл.
+        close(fd);
+    }
+}
+```
+
+Ссылка на этот [кусок кода](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/src/afl-forkserver.c#L1766)
 
 
+Первое условие проверяет, используем ли мы фаззинг через общую память. Если да (то есть, если `fsrv->use_shmem_fuzz != 0`), то мы просто копируем входные данные в буфер общей памяти с помощью `memcpy` и записываем длину данных.
+
+Если же используется ввод из файла, то мы попадаем в блок `else`.
+
+Мы начинаем с получения файлового дескриптора (`fd`). Если не используется ввод из потока ввода, то заходим в следующий блок кода.
+
+Внутри блока `if` происходит: удаление старого файла (`unlink(fsrv->out_file)`), создание нового файла с помощью фукнкии `open` с флагами: запись, создание и исключение, если файл уже существует.
+
+Если используется `stdin`, то мы просто устанавливаем указатель файла в начало с помощью `lseek(fd, 0, SEEK_SET)`.
+
+После того как файл обработан, данные записываются в файл с помощью `ck_write`.
+
+Если используется `stdin`, то после записи данных в файл, мы также вызываем `ftruncate(fd, len)`, чтобы обрезать файл до нужной длины. Это предотвращает наличие старых данных в файле после завершения работы программы.
+Затем выполняется `lseek(fd, 0, SEEK_SET)`, чтобы указатель на чтение был установлен на начало файла, что гарантирует, что дочерний процесс прочитает данные с самого начала.
+
+На этом этапе мутированные данные записываются. Все, что нам нужно сделать — это перезапустить сервер форков. Это выполняется в функции `fuzz_run_target`. Эта [функция](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/src/afl-fuzz-run.c#L44) на самом деле просто запускает таймер и [вызывает](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/src/afl-forkserver.c#L1846) `afl_fsrv_run_target`. Большая часть этой функции занимается обработкой альтернативных режимов работы `AFL++`, поэтому я привел ниже самый важный фрагмент кода данной функции.
+
+```C
+fsrv_run_result_t __attribute__((hot))
+afl_fsrv_run_target(afl_forkserver_t *fsrv, u32 timeout,
+                    volatile u8 *stop_soon_p) {
+  s32 res;
+  u32 exec_ms;
+  u32 write_value = fsrv->last_run_timed_out;
+...
+  /* После этого memset, fsrv->trace_bits[] становятся эффективно volatile, 
+     поэтому мы должны предотвратить любые предыдущие операции, которые могут 
+     попасть в эту область. */
+  memset(fsrv->trace_bits, 0, fsrv->map_size);
+  MEM_BARRIER(); //commit all writes
+
+  /* у нас есть работающий сервер форков (или его подделка). 
+     Сначала сообщим, если предыдущий запуск завершился с тайм-аутом. */
+  if ((res = write(fsrv->fsrv_ctl_fd, &write_value, 4)) != 4) {
+    if (*stop_soon_p) { return 0; }
+    RPFATAL(res, "Unable to request new process from fork server (OOM?)");
+  }
+  fsrv->last_run_timed_out = 0;
+  if ((res = read(fsrv->fsrv_st_fd, &fsrv->child_pid, 4)) != 4) {
+    if (*stop_soon_p) { return 0; }
+    RPFATAL(res, "Unable to request new process from fork server (OOM?)");
+  }
+ 
+...
+  exec_ms = read_s32_timed(fsrv->fsrv_st_fd, &fsrv->child_status, timeout,
+                           stop_soon_p);
+
+  if (exec_ms > timeout) {
+
+    /* Если после тайм-аута не было ответа от сервера форков, 
+       мы убиваем дочерний процесс. Сервер форков должен сообщить нам об этом позже */
+    s32 tmp_pid = fsrv->child_pid;
+    if (tmp_pid > 0) {
+      kill(tmp_pid, fsrv->child_kill_signal);
+      fsrv->child_pid = -1;
+    }
+    fsrv->last_run_timed_out = 1;
+    if (read(fsrv->fsrv_st_fd, &fsrv->child_status, 4) < 4) { exec_ms = 0; }
+  }
+  if (!exec_ms) {
+    if (*stop_soon_p) { return 0; }
+    SAYF("\n" cLRD "[-] " cRST
+         "Unable to communicate with fork server. Some possible reasons:\n\n"
+         "    - You've run out of memory. Use -m to increase the the memory "
+         "limit\n"
+         "      to something higher than %llu.\n"
+         "    - The binary or one of the libraries it uses manages to "
+         "create\n"
+         "      threads before the forkserver initializes.\n"
+         "    - The binary, at least in some circumstances, exits in a way "
+         "that\n"
+         "      also kills the parent process - raise() could be the "
+         "culprit.\n"
+         "    - If using persistent mode with QEMU, "
+         "AFL_QEMU_PERSISTENT_ADDR "
+         "is\n"
+         "      probably not valid (hint: add the base address in case of "
+         "PIE)"
+         "\n\n"
+         "If all else fails you can disable the fork server via "
+         "AFL_NO_FORKSRV=1.\n",
+         fsrv->mem_limit);
+    RPFATAL(res, "Unable to communicate with fork server");
+  }
+  if (!WIFSTOPPED(fsrv->child_status)) { fsrv->child_pid = -1; }
+  fsrv->total_execs++;
+  /* Любые последующие операции с fsrv->trace_bits не должны быть перемещены 
+     компилятором ниже этой точки. После этого момента fsrv->trace_bits[] 
+     ведут себя нормально и не должны рассматриваться как volatile. */
+
+  MEM_BARRIER();
+  /* Сообщаем результат вызывающему коду. */
+  /* Был ли запуск неудачным? (а был ли мальчик...?)*/
+  if (unlikely(*(u32 *)fsrv->trace_bits == EXEC_FAIL_SIG)) {
+    return FSRV_RUN_ERROR;
+}
+  ...
+  /* успех :) */
+  return FSRV_RUN_OK;
+}
+```
+
+Давайте пройдемся по этой функции построчно:
+
+Мы начинаем с выполнения `memset` с нулем для `fsrv->trace_bits` (или карты покрытия). Это гарантирует, что карта покрытия будет обнулена и сброшена перед следующим запуском.
+
+После этого мы записываем в дочерний процесс через `ctl_pipe`. Это будит дочерний процесс для следующего запуска.
+
+Затем мы читаем PID дочернего процесса из канала статуса. Напоминаю, что сервер форков записывает PID дочернего процесса в канал статуса после форка.
+
+Предполагая, что это было успешно, мы выполняем чтение с таймаутом для статуса дочернего процесса через `read_s32_timed`. `read_s32_timed` — это функция чтение с таймаутом. То есть, после истечения заданного времени таймаута, чтение завершится, независимо от того, было ли что-то прочитано. Это помогает убедиться, что `afl-fuzz` не ждет бесконечно, если дочерний процесс завис. Значение, считанное с помощью `read_s32_timed`, — это то же самое значение, которое передается из  `__afl_start_forkserver` здесь.
+
+Как только это возвращено, мы проверяем, истек ли таймаут. Если таймаут истек, выполняется код обработки ошибки. Затем выполняется следующий код:
+```C
+if (!WIFSTOPPED(fsrv->child_status)) { fsrv->child_pid = -1; } Источник
+```
+
+Этот код проверяет, остановлен ли дочерний процесс. Если дочерний процесс не остановлен (то есть завершился), мы просто устанавливаем `fsrv->child_pid = -1`, что очищает `PID` для следующего запуска. Напоминаю, что дочерний процесс может быть остановлен только в режиме постоянного процесса, и если используется этот режим, то дочерний процесс будет перезапущен. Таким образом, если используется режим постоянного процесса, нет смысла устанавливать `fsrv->child_pid = -1`, поскольку `child_pid` будет повторно использован.
+
+Этот цикл мутировать-записать-выполнить будет выполняться бесконечно, пока либо что-то не пойдет катастрофически не так, либо мы не скажем фаззеру остановиться.
 
 
+# Заключение
 
+Статья сложная, кто прочитал - молодец, кто что-то понял - герой. 
+
+Статья писалась в рамках самообразования и посика ответов на вопросы, заданных на собеседовании (которое я провалил), поэтому может содержать ошибки. Если есть что добавить или исправить - пишите, буду благодарен.
+
+На русском языке крайне мало материалов на тему работы фаззера "изнутри", надеюсь, что Вы смогли что-то подчерпнуть для себя.
+
+
+## Что почитать?
+
+
+- [Сайт разработчика оригинального AFL](https://lcamtuf.coredump.cx/afl/);
+
+- [Документация на оригинальный AFL](https://github.com/google/AFL/blob/61037103ae3722c8060ff7082994836a794f978e/docs/technical_details.txt#L446)  (AFL++ основан на нем);
+
+- [Документация на AFL++](https://github.com/AFLplusplus/AFLplusplus/tree/stable/docs).
 
 
 
