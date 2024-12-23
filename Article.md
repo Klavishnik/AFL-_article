@@ -189,17 +189,7 @@ afl-clang-fast main.c -lreadline -o bin_fast
 - `no-prune` - позвоялет убрать отсчение некоторой информации при сборе покрытия;
 - `pc-table` - инструментация создает таблитцу, которая содержит пары [PC (Адрес базового блока.), PCFlags (Флаги, описывающие свойства базового блока)].  Позволяет отслеживать пути выполнения, которые привели к определенному состоянию.
 
-Согласно документации `LLVM` использование таких инструментаций приводит к добавлению специальных вызовов функций в определенные участики кода (в зависимости от выбранного типа инструментации). Также это накладывает на пользователя необходимость [переодпределения](https://clang.llvm.org/docs/SanitizerCoverage.html#:~:text=The%20functions%20__sanitizer_cov_trace_pc_*%20should%20be%20defined%20by%20the%20user.)  реализаций данных функций, что реализовано в AFL++, например [изменение инструментации создания PCs таблицы](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/instrumentation/afl-compiler-rt.o.c#L1521):
-
-```C
-void __sanitizer_cov_pcs_init(const uintptr_t *pcs_beg,
-                              const uintptr_t *pcs_end) {
-
-  fuzzer::TPC.HandlePCsInit(pcs_beg, pcs_end);
-
-}
-```
-Или [изменение инструментации сбора покрытия после каждого **ребра**](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/instrumentation/afl-compiler-rt.o.c#L1365).
+Согласно документации `LLVM` использование таких инструментаций приводит к добавлению специальных вызовов функций в определенные участики кода (в зависимости от выбранного типа инструментации). Также это накладывает на пользователя необходимость [переодпределения](https://clang.llvm.org/docs/SanitizerCoverage.html#:~:text=The%20functions%20__sanitizer_cov_trace_pc_*%20should%20be%20defined%20by%20the%20user.)  реализаций данных функций, что реализовано в AFL++, например [изменение инструментации создания PCs таблицы](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/instrumentation/afl-compiler-rt.o.c#L1521) или [изменение инструментации сбора покрытия после каждого **ребра**](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/instrumentation/afl-compiler-rt.o.c#L1365).
 
 
 
