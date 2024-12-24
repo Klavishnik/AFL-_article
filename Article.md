@@ -934,7 +934,7 @@ if (dup2(st_pipe[1], FORKSRV_FD + 1) < 0) { PFATAL("dup2() failed"); }
 
 
 
-## Пару слов об времени выполения `afl-fuzz`
+## Пару слов об `afl-fuzz`
 
 Время выполнения `afl-fuzz` основывается на единственном [цикле](https://github.com/AFLplusplus/AFLplusplus/blob/v4.30c/src/afl-fuzz.c#L3103) `do-while`, который выполняет основную логику работы фаззера:
 ```C
